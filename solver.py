@@ -25,6 +25,7 @@ from fake_useragent import UserAgent
 logger.remove()
 logger.add(lambda m: print(m, end=""), level=0, filter=lambda r: r["level"].name == "SUCCESS")
 
+
 warnings.filterwarnings("ignore", category=torch.serialization.SourceChangeWarning)
 warnings.filterwarnings("ignore", message=".*SIFT_create.*deprecated.*")
 
@@ -51,6 +52,76 @@ if USE_CUDA:
 
 def emergency_fallback():
     return [(80, 70), (160, 120), (240, 90)]
+
+def clamp(value, low, high):
+    return max(low, min(value, high))
+
+def rect_iou(a, b):
+    try:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = float((ix2 - ix1) * (iy2 - iy1))
+        area_a = float(max(1, ax2 - ax1) * max(1, ay2 - ay1))
+        area_b = float(max(1, bx2 - bx1) * max(1, by2 - by1))
+        union = area_a + area_b - inter
+        if union <= 0:
+            return 0.0
+        return inter / union
+    except:
+        return 0.0
+
+def dedupe_rects(rect_items, iou_threshold=0.45):
+    kept = []
+    for item in sorted(rect_items, key=lambda x: -float(x.get('conf', 0.0))):
+        rect = item.get('rect')
+        if not rect:
+            continue
+        is_dup = False
+        for existing in kept:
+            if existing.get('clz') == item.get('clz') and rect_iou(existing.get('rect'), rect) >= iou_threshold:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(item)
+    return kept
+
+def build_click_point_from_rect(rect):
+    x1, y1, x2, y2 = rect
+    center_x = int((x1 + x2) / 2)
+    center_y = int((y1 + y2) / 2)
+    rw = max(2, (x2 - x1) * 0.10)
+    rh = max(2, (y2 - y1) * 0.10)
+    offset_x = int(random.gauss(0, rw))
+    offset_y = int(random.gauss(0, rh))
+    return {"x": clamp(center_x + offset_x, 5, 315), "y": clamp(center_y + offset_y, 5, 195)}
+
+def merge_detected_with_fallback(rects, fallback_points):
+    points = [build_click_point_from_rect(rect) for rect in rects if rect and len(rect) >= 4]
+    used = set()
+    for pt in points:
+        nearest_idx = None
+        nearest_dist = None
+        for idx, fb in enumerate(fallback_points):
+            if idx in used:
+                continue
+            dist = abs(pt["x"] - fb["x"]) + abs(pt["y"] - fb["y"])
+            if nearest_dist is None or dist < nearest_dist:
+                nearest_dist = dist
+                nearest_idx = idx
+        if nearest_idx is not None:
+            used.add(nearest_idx)
+    for idx, fb in enumerate(fallback_points):
+        if len(points) >= 3:
+            break
+        if idx not in used:
+            points.append(fb)
+    return points[:3]
 
 def safe_list_access(lst, index, default=None):
     try:
@@ -109,25 +180,21 @@ def get_compiled_js_cached(file_name):
 def get_compiled_js(file_name):
     return get_compiled_js_cached(file_name)
 
-_sift_detector = None
-_sift_lock = threading.Lock()
+
+_sift_local = threading.local()
 
 def get_sift_detector():
-    global _sift_detector
-    if _sift_detector is None:
-        with _sift_lock:
-            if _sift_detector is None:
-                try:
-                    _sift_detector = cv2.SIFT_create(nfeatures=50, contrastThreshold=0.08)
-                    logger.info("Using cv2.SIFT_create()")
-                except AttributeError:
-                    try:
-                        _sift_detector = cv2.xfeatures2d.SIFT_create(nfeatures=50, contrastThreshold=0.08)
-                        logger.info("Using cv2.xfeatures2d.SIFT_create()")
-                    except AttributeError:
-                        logger.warning("SIFT not available, falling back to ORB")
-                        _sift_detector = cv2.ORB_create(nfeatures=50)
-    return _sift_detector
+    det = getattr(_sift_local, 'detector', None)
+    if det is None:
+        try:
+            det = cv2.SIFT_create(nfeatures=20, contrastThreshold=0.08)
+        except AttributeError:
+            try:
+                det = cv2.xfeatures2d.SIFT_create(nfeatures=20, contrastThreshold=0.08)
+            except AttributeError:
+                det = cv2.ORB_create(nfeatures=20)
+        _sift_local.detector = det
+    return det
 
 file_lock = threading.Lock()
 TOKEN_OUTPUT_FILE = os.path.join(DIR_PATH, 'validated_tokens.txt')
@@ -672,11 +739,19 @@ def get_clz_rect_from_image(image_data, state, threshold=0.15):
             if len(i) >= 4:
                 rect, clz, con, log_cons = i[0], i[1], i[2], i[3]
                 rw, rh = width/416, height/416
-                rect[0] = int(rect[0]*rw)
-                rect[2] = int(rect[2]*rw)
-                rect[1] = int(rect[1]*rh)
-                rect[3] = int(rect[3]*rh)
-                ret.append([clz, rect])
+                scaled = [
+                    int(rect[0] * rw),
+                    int(rect[1] * rh),
+                    int(rect[2] * rw),
+                    int(rect[3] * rh)
+                ]
+                scaled[0] = clamp(scaled[0], 0, max(0, width - 1))
+                scaled[1] = clamp(scaled[1], 0, max(0, height - 1))
+                scaled[2] = clamp(scaled[2], 0, max(0, width - 1))
+                scaled[3] = clamp(scaled[3], 0, max(0, height - 1))
+                if scaled[2] > scaled[0] and scaled[3] > scaled[1]:
+                    ret.append({"clz": clz, "rect": scaled, "conf": float(con)})
+        ret = dedupe_rects(ret)
         if len(ret) < 3 and threshold > 0.08:
             return get_clz_rect_from_image(image_data, state, threshold=0.08)
         return ret, npimg
@@ -688,7 +763,8 @@ def get_cut_img(npimg, rects):
     try:
         for item in rects:
             if len(item) >= 2:
-                clz, rect = item[0], item[1]
+                clz = item.get('clz') if isinstance(item, dict) else item[0]
+                rect = item.get('rect') if isinstance(item, dict) else item[1]
                 if len(rect) >= 4:
                     x1, y1, x2, y2 = rect[0], rect[1], rect[2], rect[3]
                     x1, y1, x2, y2 = max(0, x1), max(0, y1), min(npimg.shape[1], x2), min(npimg.shape[0], y2)
@@ -724,7 +800,7 @@ def get_flags_rects_from_image(image_data, state):
             c2 = c[0:min(20, c.shape[0]), :, :] if c.shape[0] > 0 else c
         except:
             return None, None, None
-        def get_match_lens_emergency(i1, i2, ratio=0.92):
+        def get_match_lens_emergency(i1, i2, ratio=0.78):
             try:
                 if i1.size == 0 or i2.size == 0:
                     return 0
@@ -778,32 +854,18 @@ def get_flags_rects_from_image(image_data, state):
             if len(rs) < 3:
                 return None, None, None
             r = []
-            used_types = set()
             for target_type in [1, 2, 3]:
                 candidates = [x for x in rs if len(x) >= 3 and x[2] == target_type]
                 if candidates:
                     best = max(candidates, key=lambda x: x[0])
                     r.append(best)
-                    used_types.add(target_type)
             if len(r) >= 3:
                 r = sorted(r[:3], key=lambda x: x[2])
                 return r[0][1], r[1][1], r[2][1]
             return None, None, None
         try:
-            result = try_detection(image_data)
-            if result[0] is not None:
-                return result
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            enhanced = s.copy()
-            for i in range(3):
-                enhanced[:,:,i] = clahe.apply(enhanced[:,:,i])
-            _, enhanced_img = cv2.imencode('.jpg', enhanced, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-            enhanced_data = enhanced_img.tobytes()
-            result = try_detection(enhanced_data)
-            if result[0] is not None:
-                return result
-            return None, None, None
-        except Exception as e:
+            return try_detection(image_data)
+        except:
             return None, None, None
     except Exception as e:
         return None, None, None
@@ -845,7 +907,7 @@ class Dun163:
             "X-Forwarded-For": f"{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}",
             "X-Real-IP": f"{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}"
         })
-        session.timeout = (2, 5)
+        session.timeout = (1, 3)
         return session
 
     @staticmethod
@@ -967,11 +1029,11 @@ class Dun163:
         except:
             return {}, 0.0
 
-    def handle_click_captcha_hybrid(self, bg_url, token, attempt_num=0):
+    def handle_click_captcha_hybrid(self, bg_url, token):
         try:
             headers = {"User-Agent": self.request_params['ua']}
             proxies = {"http": PROXY, "https": PROXY} if PROXY else None
-            resp = requests.get(bg_url, headers=headers, proxies=proxies, timeout=5)
+            resp = requests.get(bg_url, headers=headers, proxies=proxies, timeout=3)
             resp.raise_for_status()
             image_data = resp.content
             img_start_time = time.time()
@@ -986,23 +1048,13 @@ class Dun163:
             rect2 = safe_list_access(rects, 1)
             rect3 = safe_list_access(rects, 2)
             if rect1 is not None and rect2 is not None and rect3 is not None:
-                click_points = []
-                for rect in [rect1, rect2, rect3]:
-                    if rect and len(rect) >= 4:
-                        x1, y1, x2, y2 = rect[0], rect[1], rect[2], rect[3]
-                        center_x = int((x1 + x2) / 2)
-                        center_y = int((y1 + y2) / 2)
-                        rw = max(2, (x2 - x1) * 0.12)
-                        rh = max(2, (y2 - y1) * 0.12)
-                        offset_x = int(random.gauss(0, rw))
-                        offset_y = int(random.gauss(0, rh))
-                        final_x = max(5, min(center_x + offset_x, 315))
-                        final_y = max(5, min(center_y + offset_y, 195))
-                        click_points.append({"x": final_x, "y": final_y})
+                click_points = [build_click_point_from_rect(rect) for rect in [rect1, rect2, rect3] if rect and len(rect) >= 4]
                 if len(click_points) >= 3:
                     self._current_click_points = click_points[:3]
                     return click_points[:3], img_time
-            click_points = self.generate_emergency_clicks()
+            fallback_points = self.generate_emergency_clicks()
+            partial_rects = [rect for rect in [rect1, rect2, rect3] if rect is not None and len(rect) >= 4]
+            click_points = merge_detected_with_fallback(partial_rects, fallback_points) if partial_rects else fallback_points
             self._current_click_points = click_points
             return click_points, img_time
         except Exception as e:
@@ -1025,7 +1077,7 @@ class Dun163:
                 [(130, 90), (190, 75), (250, 125)],
             ]
             selected_pattern = random.choice(patterns)
-            angle = random.uniform(-3, 3)
+            angle = math.radians(random.uniform(-3, 3))
             cx, cy = 160, 95
             click_points = []
             for x, y in selected_pattern:
@@ -1040,15 +1092,15 @@ class Dun163:
         except:
             return [{"x": 80, "y": 70}, {"x": 160, "y": 120}, {"x": 240, "y": 90}]
 
-    def handle_slider_captcha(self, bg_url, front_url, token, attempt_num=0):
+    def handle_slider_captcha(self, bg_url, front_url, token):
         try:
             headers = {"User-Agent": self.request_params['ua']}
             proxies = {"http": PROXY, "https": PROXY} if PROXY else None
-            resp_bg = requests.get(bg_url, headers=headers, proxies=proxies, timeout=5)
+            resp_bg = requests.get(bg_url, headers=headers, proxies=proxies, timeout=3)
             resp_bg.raise_for_status()
             bg_array = np.frombuffer(resp_bg.content, dtype=np.uint8)
             bg = cv2.imdecode(bg_array, cv2.IMREAD_COLOR)
-            resp_front = requests.get(front_url, headers=headers, proxies=proxies, timeout=5)
+            resp_front = requests.get(front_url, headers=headers, proxies=proxies, timeout=3)
             resp_front.raise_for_status()
             front_array = np.frombuffer(resp_front.content, dtype=np.uint8)
             front = cv2.imdecode(front_array, cv2.IMREAD_UNCHANGED)
@@ -1074,12 +1126,8 @@ class Dun163:
         except:
             return False
 
-    def run(self, attempt_num=0):
+    def run(self):
         try:
-            if attempt_num > 0 and attempt_num % 3 == 0:
-                self.request_params['ua'] = UserAgent().random
-                self.ss = self.set_session()
-                self.ctx = get_compiled_js('dun163.js')
             get_conf_data = self.request_getconf()
             if not get_conf_data:
                 return False
@@ -1103,12 +1151,12 @@ class Dun163:
                 front_urls = get_data.get('front', [])
                 if not front_urls:
                     return False
-                slider_data = self.handle_slider_captcha(bg_urls[0], front_urls[0], token, attempt_num)
+                slider_data = self.handle_slider_captcha(bg_urls[0], front_urls[0], token)
                 if slider_data is None:
                     return False
                 resp_json, js_time = self.request_check(dt, bid, token=token, captcha_type=2, slider_data=slider_data)
             elif captcha_type == 7:
-                click_points, img_time = self.handle_click_captcha_hybrid(bg_urls[0], token, attempt_num)
+                click_points, img_time = self.handle_click_captcha_hybrid(bg_urls[0], token)
                 resp_json, js_time = self.request_check(dt, bid, token=token, captcha_type=7, click_data=click_points)
             else:
                 return False
@@ -1138,38 +1186,31 @@ class Dun163:
             return False
 
 def worker_thread(thread_id, config):
+    d = None
+    cycle = 0
     while True:
         try:
-            config['UA'] = UserAgent().random
-            config['DOMAIN'] = random.choice(DUN163_DOMAINS)
-            d = Dun163(
-                id_=config['ID_'],
-                referer=config['REFERER'],
-                fp_h=config['FP_H'],
-                ua=config['UA'],
-                thread_id=thread_id,
-                domain=config['DOMAIN']
-            )
-            attempt = 0
-            success_count = 0
-            consecutive_failures = 0
-            while True:
-                attempt += 1
-                if consecutive_failures > 8:
-                    break
-                try:
-                    success = d.run(attempt_num=attempt)
-                    if success:
-                        success_count += 1
-                        consecutive_failures = 0
-                        logger.success(f"T-{thread_id} | Attempt {attempt} | Success #{success_count}")
-                    else:
-                        consecutive_failures += 1
-                except:
-                    consecutive_failures += 1
-            continue
+            if d is None or cycle >= 3:
+                d = None
+                config['UA'] = UserAgent().random
+                config['DOMAIN'] = random.choice(DUN163_DOMAINS)
+                d = Dun163(
+                    id_=config['ID_'],
+                    referer=config['REFERER'],
+                    fp_h=config['FP_H'],
+                    ua=config['UA'],
+                    thread_id=thread_id,
+                    domain=config['DOMAIN']
+                )
+                cycle = 0
+            success = d.run()
+            cycle += 1
+            if success:
+                logger.success(f"T-{thread_id} | Success")
+                cycle = 3
         except Exception as e:
             logger.error(f"T-{thread_id} | Worker crashed: {e}")
+            d = None
             continue
 
 def main():
@@ -1182,7 +1223,6 @@ def main():
     if not js_ctx:
         logger.error("JavaScript not available - cannot continue")
         return
-    sift_detector = get_sift_detector()
     logger.success("All resources loaded")
     config = {
         'ID_': ID,
