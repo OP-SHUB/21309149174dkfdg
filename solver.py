@@ -8,10 +8,10 @@ import warnings
 import math
 import threading
 import urllib.parse
+import gc
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
-from requests.adapters import HTTPAdapter
 import execjs
 from loguru import logger
 import cv2
@@ -19,13 +19,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 from collections import OrderedDict
-import queue
 from functools import lru_cache
 from fake_useragent import UserAgent
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger.remove()
 logger.add(lambda m: print(m, end=""), level=0, filter=lambda r: r["level"].name == "SUCCESS")
-
 
 warnings.filterwarnings("ignore", category=torch.serialization.SourceChangeWarning)
 warnings.filterwarnings("ignore", message=".*SIFT_create.*deprecated.*")
@@ -33,73 +33,23 @@ warnings.filterwarnings("ignore", message=".*SIFT_create.*deprecated.*")
 DEBUG = False
 
 DIR_PATH = os.path.dirname(os.path.abspath(__file__))
-USE_CUDA = False
+USE_CUDA = torch.cuda.is_available()
 DEVICE = 'cuda' if USE_CUDA else 'cpu'
 
-torch.set_num_threads(1)
-try:
-    torch.set_num_interop_threads(1)
-except Exception:
-    pass
-
-TOKEN_SERVER_URL = os.environ.get('TOKEN_SERVER_URL', 'https://dshburddss.onrender.com')
+TOKEN_SERVER_URL = os.environ.get('TOKEN_SERVER_URL', 'https://dshburddss.onrender.com/')
 TOKEN_SAVE_ENDPOINT = f"{TOKEN_SERVER_URL}/api/save-token"
-REQUEST_TIMEOUT = (2, 5)
-IMAGE_TIMEOUT = (2, 4)
-SESSION_RECYCLE_EVERY = 12
-MAX_CONSECUTIVE_FAILURES = 4
-SEND_POOL_SIZE = 128
 
-DEFAULT_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-]
+_ua_pool = threading.local()
 
-_http_adapter = HTTPAdapter(pool_connections=SEND_POOL_SIZE, pool_maxsize=SEND_POOL_SIZE, max_retries=0)
-_send_session_local = threading.local()
-
-
-def build_http_session():
-    session = requests.Session()
-    session.mount('https://', _http_adapter)
-    session.mount('http://', _http_adapter)
-    return session
-
-
-def get_send_session():
-    session = getattr(_send_session_local, 'session', None)
-    if session is None:
-        session = build_http_session()
-        _send_session_local.session = session
-    return session
-
-
-_ua_local = threading.local()
-
-
-def get_random_user_agent():
-    cached_pool = getattr(_ua_local, 'pool', None)
-    if cached_pool is None:
-        cached_pool = list(DEFAULT_USER_AGENTS)
-        try:
-            ua = UserAgent()
-            extra = []
-            for _ in range(4):
-                candidate = ua.random
-                if candidate and candidate not in cached_pool and len(candidate) < 300:
-                    extra.append(candidate)
-            cached_pool.extend(extra)
-        except Exception:
-            pass
-        _ua_local.pool = cached_pool
-    return random.choice(cached_pool)
+def get_random_ua():
+    if not hasattr(_ua_pool, 'cache'):
+        _ua_pool.cache = [UserAgent().random for _ in range(20)]
+    return random.choice(_ua_pool.cache)
 
 def send_token_to_server(token):
     try:
         payload = {"token": token}
-        r = get_send_session().post(TOKEN_SAVE_ENDPOINT, json=payload, timeout=REQUEST_TIMEOUT)
+        r = requests.post(TOKEN_SAVE_ENDPOINT, json=payload, timeout=5)
         return r.status_code in [200, 201]
     except:
         return False
@@ -107,9 +57,6 @@ def send_token_to_server(token):
 if USE_CUDA:
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
-
-def emergency_fallback():
-    return [(80, 70), (160, 120), (240, 90)]
 
 def clamp(value, low, high):
     return max(low, min(value, high))
@@ -159,28 +106,6 @@ def build_click_point_from_rect(rect):
     offset_y = int(random.gauss(0, rh))
     return {"x": clamp(center_x + offset_x, 5, 315), "y": clamp(center_y + offset_y, 5, 195)}
 
-def merge_detected_with_fallback(rects, fallback_points):
-    points = [build_click_point_from_rect(rect) for rect in rects if rect and len(rect) >= 4]
-    used = set()
-    for pt in points:
-        nearest_idx = None
-        nearest_dist = None
-        for idx, fb in enumerate(fallback_points):
-            if idx in used:
-                continue
-            dist = abs(pt["x"] - fb["x"]) + abs(pt["y"] - fb["y"])
-            if nearest_dist is None or dist < nearest_dist:
-                nearest_dist = dist
-                nearest_idx = idx
-        if nearest_idx is not None:
-            used.add(nearest_idx)
-    for idx, fb in enumerate(fallback_points):
-        if len(points) >= 3:
-            break
-        if idx not in used:
-            points.append(fb)
-    return points[:3]
-
 def safe_list_access(lst, index, default=None):
     try:
         if lst is None or not isinstance(lst, (list, tuple)):
@@ -213,6 +138,7 @@ def initialize_global_model():
                 if USE_CUDA:
                     state['net'] = state['net'].half()
             _model_state = state
+            torch.set_grad_enabled(False)
             logger.success(f"Model loaded on {DEVICE}")
             return _model_state
         except:
@@ -224,7 +150,7 @@ def get_global_model():
         return initialize_global_model()
     return _model_state
 
-@lru_cache(maxsize=5)
+@lru_cache(maxsize=1)
 def get_compiled_js_cached(file_name):
     try:
         js_path = os.path.join(DIR_PATH, file_name)
@@ -238,19 +164,18 @@ def get_compiled_js_cached(file_name):
 def get_compiled_js(file_name):
     return get_compiled_js_cached(file_name)
 
-
 _sift_local = threading.local()
 
 def get_sift_detector():
     det = getattr(_sift_local, 'detector', None)
     if det is None:
         try:
-            det = cv2.SIFT_create(nfeatures=20, contrastThreshold=0.08)
+            det = cv2.SIFT_create(nfeatures=10, contrastThreshold=0.1, edgeThreshold=15)
         except AttributeError:
             try:
-                det = cv2.xfeatures2d.SIFT_create(nfeatures=20, contrastThreshold=0.08)
+                det = cv2.xfeatures2d.SIFT_create(nfeatures=10, contrastThreshold=0.1, edgeThreshold=15)
             except AttributeError:
-                det = cv2.ORB_create(nfeatures=20)
+                det = cv2.ORB_create(nfeatures=10)
         _sift_local.detector = det
     return det
 
@@ -591,7 +516,7 @@ def find_gap_position(bg, front):
     front_crop = front_rgb[y_ct:y_ct + h_ct, x_ct:x_ct + w_ct]
     mask_crop = mask[y_ct:y_ct + h_ct, x_ct:x_ct + w_ct]
     results = []
-    for name, method in [("CCOEFF_normed", cv2.TM_CCOEFF_NORMED), ("CCORR_normed", cv2.TM_CCORR_NORMED)]:
+    for name, method in [("CCOEFF_normed", cv2.TM_CCOEFF_NORMED)]:
         try:
             r = cv2.matchTemplate(bg, front_crop, method, mask=mask_crop)
             _, _, _, loc = cv2.minMaxLoc(r)
@@ -610,14 +535,13 @@ def find_gap_position(bg, front):
         results.append(loc[0])
     except:
         pass
-    bg_sobel = np.abs(cv2.Sobel(bg_gray, cv2.CV_64F, 1, 0, ksize=3)).astype(np.uint8)
-    fg_sobel = np.abs(cv2.Sobel(fg_gray, cv2.CV_64F, 1, 0, ksize=3)).astype(np.uint8)
-    try:
-        r = cv2.matchTemplate(bg_sobel, fg_sobel, cv2.TM_CCOEFF_NORMED, mask=mask)
-        _, _, _, loc = cv2.minMaxLoc(r)
-        results.append(loc[0])
-    except:
-        pass
+    if not results:
+        pos = 0.0
+        for i in range(bg.shape[1] - front.shape[1]):
+            diff = int(np.sum(np.abs(bg[:, i:i+front.shape[1], :3].astype(int) - front_rgb.astype(int))))
+            if diff > pos:
+                pos = i
+        results.append(float(pos))
     if not results:
         return 0.0
     median = sorted(results)[len(results) // 2]
@@ -784,9 +708,8 @@ def get_clz_rect_from_image(image_data, state, threshold=0.15):
         npimg_rgb = cv2.cvtColor(npimg, cv2.COLOR_BGR2RGB)
         npimg_resized = cv2.resize(npimg_rgb, (416, 416), interpolation=cv2.INTER_LINEAR)
         npimg_ = np.transpose(npimg_resized, (2,1,0))
-        with torch.inference_mode():
-            input_tensor = torch.from_numpy(npimg_).unsqueeze(0).to(DEVICE, non_blocking=False)
-            input_tensor = input_tensor.float()
+        with torch.no_grad():
+            input_tensor = torch.FloatTensor(npimg_).unsqueeze(0).to(DEVICE)
             if USE_CUDA:
                 input_tensor = input_tensor.half()
             y_pred = net(input_tensor)
@@ -944,13 +867,18 @@ class Dun163:
         }
         self.ss = self.set_session()
         self.ctx = get_compiled_js('dun163.js')
-        self.fp = None
-        self.solve_count = 0
-        self.consecutive_failures = 0
 
     def set_session(self):
-        session = build_http_session()
+        session = requests.Session()
         domain_host = self.domain.replace('https://', '').replace('http://', '')
+        adapter = HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=20,
+            max_retries=Retry(total=1, backoff_factor=0.1, allowed_methods=['GET']),
+            pool_block=False
+        )
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
         session.headers.update({
             "Accept": "*/*",
             "Accept-Language": "*",
@@ -965,18 +893,10 @@ class Dun163:
             "X-Forwarded-For": f"{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}",
             "X-Real-IP": f"{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}"
         })
+        session.timeout = (1, 3)
         return session
 
-    def rotate_identity(self, *, force=False):
-        if force or self.solve_count <= 0 or self.solve_count % SESSION_RECYCLE_EVERY == 0:
-            self.request_params['ua'] = get_random_user_agent()
-            self.domain = random.choice(DUN163_DOMAINS)
-            self.ss = self.set_session()
-        self.fp = None
-
-    @staticmethod
-    @lru_cache(maxsize=1000)
-    def get_jsonp(text):
+    def get_jsonp(self, text):
         try:
             jsonp_str = re.search(r"\((.*)\)", text, re.S)
             if jsonp_str:
@@ -985,8 +905,7 @@ class Dun163:
         except:
             return {}
 
-    @staticmethod
-    def random_jsonp_str():
+    def random_jsonp_str(self):
         s = string.ascii_lowercase + string.digits
         text = ''.join(random.choices(s, k=7))
         return "__JSONP_" + text + '_'
@@ -1006,7 +925,7 @@ class Dun163:
                 "lang": "en-US",
                 "callback": self.random_jsonp_str() + '0'
             }
-            response = self.ss.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            response = self.ss.get(url, params=params)
             response.raise_for_status()
             resp_json = self.get_jsonp(response.text)
             return resp_json.get('data', {})
@@ -1016,10 +935,9 @@ class Dun163:
     def request_get(self, dt, bid, ac_token, ir_token=None):
         try:
             url = self.domain + '/api/v3/get'
-            if not self.fp:
-                self.fp = self.ctx.call('get_fp', self.request_params['fp_h'], self.request_params['ua'])
-            fp = self.fp
+            fp = self.ctx.call('get_fp', self.request_params['fp_h'], self.request_params['ua'])
             cb = self.ctx.call('get_cb')
+            self.fp = fp
             params = {
                 "referer": self.request_params['referer'],
                 "zoneId": "CN31",
@@ -1050,7 +968,7 @@ class Dun163:
             }
             if ir_token:
                 params["irToken"] = ir_token
-            resp_text = self.ss.get(url, params=params, timeout=REQUEST_TIMEOUT).text
+            resp_text = self.ss.get(url, params=params).text
             resp_json = self.get_jsonp(resp_text)
             return resp_json.get('data', {})
         except:
@@ -1088,7 +1006,7 @@ class Dun163:
                 "iv": "4",
                 "callback": self.random_jsonp_str() + '1'
             }
-            resp = self.ss.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            resp = self.ss.get(url, params=params)
             resp_json = self.get_jsonp(resp.text)
             return resp_json.get('data', {}), js_time
         except:
@@ -1097,7 +1015,7 @@ class Dun163:
     def handle_click_captcha_hybrid(self, bg_url, token):
         try:
             headers = {"User-Agent": self.request_params['ua']}
-            resp = self.ss.get(bg_url, headers=headers, timeout=IMAGE_TIMEOUT)
+            resp = requests.get(bg_url, headers=headers, timeout=3)
             resp.raise_for_status()
             image_data = resp.content
             img_start_time = time.time()
@@ -1116,11 +1034,7 @@ class Dun163:
                 if len(click_points) >= 3:
                     self._current_click_points = click_points[:3]
                     return click_points[:3], img_time
-            fallback_points = self.generate_emergency_clicks()
-            partial_rects = [rect for rect in [rect1, rect2, rect3] if rect is not None and len(rect) >= 4]
-            click_points = merge_detected_with_fallback(partial_rects, fallback_points) if partial_rects else fallback_points
-            self._current_click_points = click_points
-            return click_points, img_time
+            return self.generate_emergency_clicks(), img_time
         except Exception as e:
             return self.generate_emergency_clicks(), 0.0
 
@@ -1146,7 +1060,7 @@ class Dun163:
             click_points = []
             for x, y in selected_pattern:
                 rx = cx + (x - cx) * math.cos(angle) - (y - cy) * math.sin(angle)
-                ry = cy + (x - cx) * math.sin(angle) + (y - cy) * math.cos(angle)
+                ry = cy + (x - cy) * math.sin(angle) + (y - cy) * math.cos(angle)
                 offset_x = int(random.gauss(0, 8))
                 offset_y = int(random.gauss(0, 8))
                 final_x = max(10, min(int(rx) + offset_x, 310))
@@ -1159,11 +1073,11 @@ class Dun163:
     def handle_slider_captcha(self, bg_url, front_url, token):
         try:
             headers = {"User-Agent": self.request_params['ua']}
-            resp_bg = self.ss.get(bg_url, headers=headers, timeout=IMAGE_TIMEOUT)
+            resp_bg = requests.get(bg_url, headers=headers, timeout=3)
             resp_bg.raise_for_status()
             bg_array = np.frombuffer(resp_bg.content, dtype=np.uint8)
             bg = cv2.imdecode(bg_array, cv2.IMREAD_COLOR)
-            resp_front = self.ss.get(front_url, headers=headers, timeout=IMAGE_TIMEOUT)
+            resp_front = requests.get(front_url, headers=headers, timeout=3)
             resp_front.raise_for_status()
             front_array = np.frombuffer(resp_front.content, dtype=np.uint8)
             front = cv2.imdecode(front_array, cv2.IMREAD_UNCHANGED)
@@ -1191,14 +1105,8 @@ class Dun163:
 
     def run(self):
         try:
-            if not self.ctx:
-                return False
-            self.solve_count += 1
-            if self.solve_count == 1 or self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                self.rotate_identity(force=True)
             get_conf_data = self.request_getconf()
             if not get_conf_data:
-                self.consecutive_failures += 1
                 return False
             dt = get_conf_data.get('dt')
             ac_data = get_conf_data.get('ac', {})
@@ -1208,16 +1116,13 @@ class Dun163:
             ir_token = ir_data.get('token') if ir_data.get('enable') else None
             get_data = self.request_get(dt, bid, ac_token, ir_token)
             if not get_data:
-                self.consecutive_failures += 1
                 return False
             captcha_type = get_data.get('type', 7)
             token = get_data.get('token')
             if not token:
-                self.consecutive_failures += 1
                 return False
             bg_urls = get_data.get('bg', [])
             if not bg_urls:
-                self.consecutive_failures += 1
                 return False
             if captcha_type == 2:
                 front_urls = get_data.get('front', [])
@@ -1225,14 +1130,12 @@ class Dun163:
                     return False
                 slider_data = self.handle_slider_captcha(bg_urls[0], front_urls[0], token)
                 if slider_data is None:
-                    self.consecutive_failures += 1
                     return False
                 resp_json, js_time = self.request_check(dt, bid, token=token, captcha_type=2, slider_data=slider_data)
             elif captcha_type == 7:
                 click_points, img_time = self.handle_click_captcha_hybrid(bg_urls[0], token)
                 resp_json, js_time = self.request_check(dt, bid, token=token, captcha_type=7, click_data=click_points)
             else:
-                self.consecutive_failures += 1
                 return False
             self.resp_json2 = resp_json
             if resp_json.get('result') == True:
@@ -1250,26 +1153,36 @@ class Dun163:
                     else:
                         self.save_token_locally(validate_decoded)
                         logger.success(f'T-{self.thread_id} SUCCESS: {validate_decoded[:40]}... | Saved locally')
-                    self.consecutive_failures = 0
                     return True
-            self.consecutive_failures += 1
             return False
         except:
             try:
-                self.consecutive_failures += 1
-                if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    self.rotate_identity(force=True)
+                self.ss = self.set_session()
             except:
                 pass
             return False
 
+_global_cycle_count = 0
+_global_cycle_lock = threading.Lock()
+
+def periodic_cleanup():
+    global _global_cycle_count
+    with _global_cycle_lock:
+        _global_cycle_count += 1
+        if _global_cycle_count % 50 == 0:
+            gc.collect()
+            if USE_CUDA:
+                torch.cuda.empty_cache()
+            _global_cycle_count = 0
+
 def worker_thread(thread_id, config):
     d = None
+    cycle = 0
     while True:
         try:
-            if d is None:
+            if d is None or cycle >= 5:
                 d = None
-                config['UA'] = get_random_user_agent()
+                config['UA'] = get_random_ua()
                 config['DOMAIN'] = random.choice(DUN163_DOMAINS)
                 d = Dun163(
                     id_=config['ID_'],
@@ -1279,18 +1192,18 @@ def worker_thread(thread_id, config):
                     thread_id=thread_id,
                     domain=config['DOMAIN']
                 )
+                cycle = 0
             success = d.run()
+            cycle += 1
+            periodic_cleanup()
             if success:
-                logger.success(f"T-{thread_id} | Success")
-            elif d.consecutive_failures >= MAX_CONSECUTIVE_FAILURES * 2:
-                d = None
+                cycle = 5
         except Exception as e:
-            logger.error(f"T-{thread_id} | Worker crashed: {e}")
             d = None
             continue
 
 def main():
-    logger.info("Starting CN31 Solver...")
+    logger.info("Starting CN31 Solver (Optimized)...")
     model_state = initialize_global_model()
     if not model_state:
         logger.error("Model not available - cannot continue")
@@ -1304,8 +1217,6 @@ def main():
         'ID_': ID,
         'REFERER': REFERER,
         'FP_H': FP_H,
-        'UA': get_random_user_agent(),
-        'DOMAIN': DUN163_DOMAINS[0]
     }
     NUM_THREADS = int(input("Number of threads: ").strip())
     logger.info(f"Starting {NUM_THREADS} worker threads")
@@ -1313,25 +1224,19 @@ def main():
     logger.info(f"REFERER: {REFERER}")
     logger.info(f"Server URL: {TOKEN_SERVER_URL}")
     logger.info("-" * 50)
-    while True:
+    with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
+        futures = []
+        for i in range(NUM_THREADS):
+            thread_config = config.copy()
+            thread_config['UA'] = get_random_ua()
+            thread_config['DOMAIN'] = DUN163_DOMAINS[i % len(DUN163_DOMAINS)]
+            futures.append(executor.submit(worker_thread, i+1, thread_config))
         try:
-            with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
-                futures = []
-                for i in range(NUM_THREADS):
-                    thread_config = config.copy()
-                    thread_config['UA'] = get_random_user_agent()
-                    thread_config['DOMAIN'] = DUN163_DOMAINS[i % len(DUN163_DOMAINS)]
-                    future = executor.submit(worker_thread, i+1, thread_config)
-                    futures.append(future)
-                for future in futures:
-                    future.result()
+            for future in futures:
+                future.result()
         except KeyboardInterrupt:
             logger.warning("Stopping...")
             executor.shutdown(wait=False)
-            break
-        except Exception as e:
-            logger.error(f"Main loop crashed: {e}")
-            continue
 
 if __name__ == '__main__':
     main()
