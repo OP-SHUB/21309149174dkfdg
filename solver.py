@@ -11,6 +11,7 @@ import urllib.parse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import requests
+from requests.adapters import HTTPAdapter
 import execjs
 from loguru import logger
 import cv2
@@ -32,16 +33,73 @@ warnings.filterwarnings("ignore", message=".*SIFT_create.*deprecated.*")
 DEBUG = False
 
 DIR_PATH = os.path.dirname(os.path.abspath(__file__))
-USE_CUDA = True if torch.cuda.is_available() else False
+USE_CUDA = False
 DEVICE = 'cuda' if USE_CUDA else 'cpu'
 
-TOKEN_SERVER_URL = os.environ.get('TOKEN_SERVER_URL', 'https://dshburddss.onrender.com/')
+torch.set_num_threads(1)
+try:
+    torch.set_num_interop_threads(1)
+except Exception:
+    pass
+
+TOKEN_SERVER_URL = os.environ.get('TOKEN_SERVER_URL', 'https://dshburddss.onrender.com')
 TOKEN_SAVE_ENDPOINT = f"{TOKEN_SERVER_URL}/api/save-token"
+REQUEST_TIMEOUT = (2, 5)
+IMAGE_TIMEOUT = (2, 4)
+SESSION_RECYCLE_EVERY = 12
+MAX_CONSECUTIVE_FAILURES = 4
+SEND_POOL_SIZE = 128
+
+DEFAULT_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+]
+
+_http_adapter = HTTPAdapter(pool_connections=SEND_POOL_SIZE, pool_maxsize=SEND_POOL_SIZE, max_retries=0)
+_send_session_local = threading.local()
+
+
+def build_http_session():
+    session = requests.Session()
+    session.mount('https://', _http_adapter)
+    session.mount('http://', _http_adapter)
+    return session
+
+
+def get_send_session():
+    session = getattr(_send_session_local, 'session', None)
+    if session is None:
+        session = build_http_session()
+        _send_session_local.session = session
+    return session
+
+
+_ua_local = threading.local()
+
+
+def get_random_user_agent():
+    cached_pool = getattr(_ua_local, 'pool', None)
+    if cached_pool is None:
+        cached_pool = list(DEFAULT_USER_AGENTS)
+        try:
+            ua = UserAgent()
+            extra = []
+            for _ in range(4):
+                candidate = ua.random
+                if candidate and candidate not in cached_pool and len(candidate) < 300:
+                    extra.append(candidate)
+            cached_pool.extend(extra)
+        except Exception:
+            pass
+        _ua_local.pool = cached_pool
+    return random.choice(cached_pool)
 
 def send_token_to_server(token):
     try:
         payload = {"token": token}
-        r = requests.post(TOKEN_SAVE_ENDPOINT, json=payload, timeout=5)
+        r = get_send_session().post(TOKEN_SAVE_ENDPOINT, json=payload, timeout=REQUEST_TIMEOUT)
         return r.status_code in [200, 201]
     except:
         return False
@@ -726,8 +784,9 @@ def get_clz_rect_from_image(image_data, state, threshold=0.15):
         npimg_rgb = cv2.cvtColor(npimg, cv2.COLOR_BGR2RGB)
         npimg_resized = cv2.resize(npimg_rgb, (416, 416), interpolation=cv2.INTER_LINEAR)
         npimg_ = np.transpose(npimg_resized, (2,1,0))
-        with torch.no_grad():
-            input_tensor = torch.FloatTensor(npimg_).unsqueeze(0).to(DEVICE)
+        with torch.inference_mode():
+            input_tensor = torch.from_numpy(npimg_).unsqueeze(0).to(DEVICE, non_blocking=False)
+            input_tensor = input_tensor.float()
             if USE_CUDA:
                 input_tensor = input_tensor.half()
             y_pred = net(input_tensor)
@@ -885,9 +944,12 @@ class Dun163:
         }
         self.ss = self.set_session()
         self.ctx = get_compiled_js('dun163.js')
+        self.fp = None
+        self.solve_count = 0
+        self.consecutive_failures = 0
 
     def set_session(self):
-        session = requests.Session()
+        session = build_http_session()
         domain_host = self.domain.replace('https://', '').replace('http://', '')
         session.headers.update({
             "Accept": "*/*",
@@ -903,8 +965,14 @@ class Dun163:
             "X-Forwarded-For": f"{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}",
             "X-Real-IP": f"{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}"
         })
-        session.timeout = (1, 3)
         return session
+
+    def rotate_identity(self, *, force=False):
+        if force or self.solve_count <= 0 or self.solve_count % SESSION_RECYCLE_EVERY == 0:
+            self.request_params['ua'] = get_random_user_agent()
+            self.domain = random.choice(DUN163_DOMAINS)
+            self.ss = self.set_session()
+        self.fp = None
 
     @staticmethod
     @lru_cache(maxsize=1000)
@@ -938,7 +1006,7 @@ class Dun163:
                 "lang": "en-US",
                 "callback": self.random_jsonp_str() + '0'
             }
-            response = self.ss.get(url, params=params)
+            response = self.ss.get(url, params=params, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             resp_json = self.get_jsonp(response.text)
             return resp_json.get('data', {})
@@ -948,9 +1016,10 @@ class Dun163:
     def request_get(self, dt, bid, ac_token, ir_token=None):
         try:
             url = self.domain + '/api/v3/get'
-            fp = self.ctx.call('get_fp', self.request_params['fp_h'], self.request_params['ua'])
+            if not self.fp:
+                self.fp = self.ctx.call('get_fp', self.request_params['fp_h'], self.request_params['ua'])
+            fp = self.fp
             cb = self.ctx.call('get_cb')
-            self.fp = fp
             params = {
                 "referer": self.request_params['referer'],
                 "zoneId": "CN31",
@@ -981,7 +1050,7 @@ class Dun163:
             }
             if ir_token:
                 params["irToken"] = ir_token
-            resp_text = self.ss.get(url, params=params).text
+            resp_text = self.ss.get(url, params=params, timeout=REQUEST_TIMEOUT).text
             resp_json = self.get_jsonp(resp_text)
             return resp_json.get('data', {})
         except:
@@ -1019,7 +1088,7 @@ class Dun163:
                 "iv": "4",
                 "callback": self.random_jsonp_str() + '1'
             }
-            resp = self.ss.get(url, params=params)
+            resp = self.ss.get(url, params=params, timeout=REQUEST_TIMEOUT)
             resp_json = self.get_jsonp(resp.text)
             return resp_json.get('data', {}), js_time
         except:
@@ -1028,7 +1097,7 @@ class Dun163:
     def handle_click_captcha_hybrid(self, bg_url, token):
         try:
             headers = {"User-Agent": self.request_params['ua']}
-            resp = requests.get(bg_url, headers=headers, timeout=3)
+            resp = self.ss.get(bg_url, headers=headers, timeout=IMAGE_TIMEOUT)
             resp.raise_for_status()
             image_data = resp.content
             img_start_time = time.time()
@@ -1090,11 +1159,11 @@ class Dun163:
     def handle_slider_captcha(self, bg_url, front_url, token):
         try:
             headers = {"User-Agent": self.request_params['ua']}
-            resp_bg = requests.get(bg_url, headers=headers, timeout=3)
+            resp_bg = self.ss.get(bg_url, headers=headers, timeout=IMAGE_TIMEOUT)
             resp_bg.raise_for_status()
             bg_array = np.frombuffer(resp_bg.content, dtype=np.uint8)
             bg = cv2.imdecode(bg_array, cv2.IMREAD_COLOR)
-            resp_front = requests.get(front_url, headers=headers, timeout=3)
+            resp_front = self.ss.get(front_url, headers=headers, timeout=IMAGE_TIMEOUT)
             resp_front.raise_for_status()
             front_array = np.frombuffer(resp_front.content, dtype=np.uint8)
             front = cv2.imdecode(front_array, cv2.IMREAD_UNCHANGED)
@@ -1122,8 +1191,14 @@ class Dun163:
 
     def run(self):
         try:
+            if not self.ctx:
+                return False
+            self.solve_count += 1
+            if self.solve_count == 1 or self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                self.rotate_identity(force=True)
             get_conf_data = self.request_getconf()
             if not get_conf_data:
+                self.consecutive_failures += 1
                 return False
             dt = get_conf_data.get('dt')
             ac_data = get_conf_data.get('ac', {})
@@ -1133,13 +1208,16 @@ class Dun163:
             ir_token = ir_data.get('token') if ir_data.get('enable') else None
             get_data = self.request_get(dt, bid, ac_token, ir_token)
             if not get_data:
+                self.consecutive_failures += 1
                 return False
             captcha_type = get_data.get('type', 7)
             token = get_data.get('token')
             if not token:
+                self.consecutive_failures += 1
                 return False
             bg_urls = get_data.get('bg', [])
             if not bg_urls:
+                self.consecutive_failures += 1
                 return False
             if captcha_type == 2:
                 front_urls = get_data.get('front', [])
@@ -1147,12 +1225,14 @@ class Dun163:
                     return False
                 slider_data = self.handle_slider_captcha(bg_urls[0], front_urls[0], token)
                 if slider_data is None:
+                    self.consecutive_failures += 1
                     return False
                 resp_json, js_time = self.request_check(dt, bid, token=token, captcha_type=2, slider_data=slider_data)
             elif captcha_type == 7:
                 click_points, img_time = self.handle_click_captcha_hybrid(bg_urls[0], token)
                 resp_json, js_time = self.request_check(dt, bid, token=token, captcha_type=7, click_data=click_points)
             else:
+                self.consecutive_failures += 1
                 return False
             self.resp_json2 = resp_json
             if resp_json.get('result') == True:
@@ -1170,23 +1250,26 @@ class Dun163:
                     else:
                         self.save_token_locally(validate_decoded)
                         logger.success(f'T-{self.thread_id} SUCCESS: {validate_decoded[:40]}... | Saved locally')
+                    self.consecutive_failures = 0
                     return True
+            self.consecutive_failures += 1
             return False
         except:
             try:
-                self.ss = self.set_session()
+                self.consecutive_failures += 1
+                if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    self.rotate_identity(force=True)
             except:
                 pass
             return False
 
 def worker_thread(thread_id, config):
     d = None
-    cycle = 0
     while True:
         try:
-            if d is None or cycle >= 3:
+            if d is None:
                 d = None
-                config['UA'] = UserAgent().random
+                config['UA'] = get_random_user_agent()
                 config['DOMAIN'] = random.choice(DUN163_DOMAINS)
                 d = Dun163(
                     id_=config['ID_'],
@@ -1196,12 +1279,11 @@ def worker_thread(thread_id, config):
                     thread_id=thread_id,
                     domain=config['DOMAIN']
                 )
-                cycle = 0
             success = d.run()
-            cycle += 1
             if success:
                 logger.success(f"T-{thread_id} | Success")
-                cycle = 3
+            elif d.consecutive_failures >= MAX_CONSECUTIVE_FAILURES * 2:
+                d = None
         except Exception as e:
             logger.error(f"T-{thread_id} | Worker crashed: {e}")
             d = None
@@ -1222,7 +1304,7 @@ def main():
         'ID_': ID,
         'REFERER': REFERER,
         'FP_H': FP_H,
-        'UA': UserAgent().random,
+        'UA': get_random_user_agent(),
         'DOMAIN': DUN163_DOMAINS[0]
     }
     NUM_THREADS = int(input("Number of threads: ").strip())
@@ -1237,7 +1319,7 @@ def main():
                 futures = []
                 for i in range(NUM_THREADS):
                     thread_config = config.copy()
-                    thread_config['UA'] = UserAgent().random
+                    thread_config['UA'] = get_random_user_agent()
                     thread_config['DOMAIN'] = DUN163_DOMAINS[i % len(DUN163_DOMAINS)]
                     future = executor.submit(worker_thread, i+1, thread_config)
                     futures.append(future)
