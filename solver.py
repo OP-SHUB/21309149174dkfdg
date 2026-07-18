@@ -8,9 +8,8 @@ import warnings
 import math
 import threading
 import urllib.parse
-import gc
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import requests
 import execjs
 from loguru import logger
@@ -19,13 +18,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 from collections import OrderedDict
+import queue
 from functools import lru_cache
 from fake_useragent import UserAgent
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 logger.remove()
 logger.add(lambda m: print(m, end=""), level=0, filter=lambda r: r["level"].name == "SUCCESS")
+
 
 warnings.filterwarnings("ignore", category=torch.serialization.SourceChangeWarning)
 warnings.filterwarnings("ignore", message=".*SIFT_create.*deprecated.*")
@@ -33,18 +32,11 @@ warnings.filterwarnings("ignore", message=".*SIFT_create.*deprecated.*")
 DEBUG = False
 
 DIR_PATH = os.path.dirname(os.path.abspath(__file__))
-USE_CUDA = torch.cuda.is_available()
+USE_CUDA = True if torch.cuda.is_available() else False
 DEVICE = 'cuda' if USE_CUDA else 'cpu'
 
 TOKEN_SERVER_URL = os.environ.get('TOKEN_SERVER_URL', 'https://dshburddss.onrender.com/')
 TOKEN_SAVE_ENDPOINT = f"{TOKEN_SERVER_URL}/api/save-token"
-
-_ua_pool = threading.local()
-
-def get_random_ua():
-    if not hasattr(_ua_pool, 'cache'):
-        _ua_pool.cache = [UserAgent().random for _ in range(20)]
-    return random.choice(_ua_pool.cache)
 
 def send_token_to_server(token):
     try:
@@ -57,6 +49,9 @@ def send_token_to_server(token):
 if USE_CUDA:
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
+
+def emergency_fallback():
+    return [(80, 70), (160, 120), (240, 90)]
 
 def clamp(value, low, high):
     return max(low, min(value, high))
@@ -106,6 +101,28 @@ def build_click_point_from_rect(rect):
     offset_y = int(random.gauss(0, rh))
     return {"x": clamp(center_x + offset_x, 5, 315), "y": clamp(center_y + offset_y, 5, 195)}
 
+def merge_detected_with_fallback(rects, fallback_points):
+    points = [build_click_point_from_rect(rect) for rect in rects if rect and len(rect) >= 4]
+    used = set()
+    for pt in points:
+        nearest_idx = None
+        nearest_dist = None
+        for idx, fb in enumerate(fallback_points):
+            if idx in used:
+                continue
+            dist = abs(pt["x"] - fb["x"]) + abs(pt["y"] - fb["y"])
+            if nearest_dist is None or dist < nearest_dist:
+                nearest_dist = dist
+                nearest_idx = idx
+        if nearest_idx is not None:
+            used.add(nearest_idx)
+    for idx, fb in enumerate(fallback_points):
+        if len(points) >= 3:
+            break
+        if idx not in used:
+            points.append(fb)
+    return points[:3]
+
 def safe_list_access(lst, index, default=None):
     try:
         if lst is None or not isinstance(lst, (list, tuple)):
@@ -138,7 +155,6 @@ def initialize_global_model():
                 if USE_CUDA:
                     state['net'] = state['net'].half()
             _model_state = state
-            torch.set_grad_enabled(False)
             logger.success(f"Model loaded on {DEVICE}")
             return _model_state
         except:
@@ -150,7 +166,7 @@ def get_global_model():
         return initialize_global_model()
     return _model_state
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=5)
 def get_compiled_js_cached(file_name):
     try:
         js_path = os.path.join(DIR_PATH, file_name)
@@ -164,18 +180,19 @@ def get_compiled_js_cached(file_name):
 def get_compiled_js(file_name):
     return get_compiled_js_cached(file_name)
 
+
 _sift_local = threading.local()
 
 def get_sift_detector():
     det = getattr(_sift_local, 'detector', None)
     if det is None:
         try:
-            det = cv2.SIFT_create(nfeatures=10, contrastThreshold=0.1, edgeThreshold=15)
+            det = cv2.SIFT_create(nfeatures=20, contrastThreshold=0.08)
         except AttributeError:
             try:
-                det = cv2.xfeatures2d.SIFT_create(nfeatures=10, contrastThreshold=0.1, edgeThreshold=15)
+                det = cv2.xfeatures2d.SIFT_create(nfeatures=20, contrastThreshold=0.08)
             except AttributeError:
-                det = cv2.ORB_create(nfeatures=10)
+                det = cv2.ORB_create(nfeatures=20)
         _sift_local.detector = det
     return det
 
@@ -516,7 +533,7 @@ def find_gap_position(bg, front):
     front_crop = front_rgb[y_ct:y_ct + h_ct, x_ct:x_ct + w_ct]
     mask_crop = mask[y_ct:y_ct + h_ct, x_ct:x_ct + w_ct]
     results = []
-    for name, method in [("CCOEFF_normed", cv2.TM_CCOEFF_NORMED)]:
+    for name, method in [("CCOEFF_normed", cv2.TM_CCOEFF_NORMED), ("CCORR_normed", cv2.TM_CCORR_NORMED)]:
         try:
             r = cv2.matchTemplate(bg, front_crop, method, mask=mask_crop)
             _, _, _, loc = cv2.minMaxLoc(r)
@@ -535,13 +552,14 @@ def find_gap_position(bg, front):
         results.append(loc[0])
     except:
         pass
-    if not results:
-        pos = 0.0
-        for i in range(bg.shape[1] - front.shape[1]):
-            diff = int(np.sum(np.abs(bg[:, i:i+front.shape[1], :3].astype(int) - front_rgb.astype(int))))
-            if diff > pos:
-                pos = i
-        results.append(float(pos))
+    bg_sobel = np.abs(cv2.Sobel(bg_gray, cv2.CV_64F, 1, 0, ksize=3)).astype(np.uint8)
+    fg_sobel = np.abs(cv2.Sobel(fg_gray, cv2.CV_64F, 1, 0, ksize=3)).astype(np.uint8)
+    try:
+        r = cv2.matchTemplate(bg_sobel, fg_sobel, cv2.TM_CCOEFF_NORMED, mask=mask)
+        _, _, _, loc = cv2.minMaxLoc(r)
+        results.append(loc[0])
+    except:
+        pass
     if not results:
         return 0.0
     median = sorted(results)[len(results) // 2]
@@ -871,14 +889,6 @@ class Dun163:
     def set_session(self):
         session = requests.Session()
         domain_host = self.domain.replace('https://', '').replace('http://', '')
-        adapter = HTTPAdapter(
-            pool_connections=10,
-            pool_maxsize=20,
-            max_retries=Retry(total=1, backoff_factor=0.1, allowed_methods=['GET']),
-            pool_block=False
-        )
-        session.mount('https://', adapter)
-        session.mount('http://', adapter)
         session.headers.update({
             "Accept": "*/*",
             "Accept-Language": "*",
@@ -896,7 +906,9 @@ class Dun163:
         session.timeout = (1, 3)
         return session
 
-    def get_jsonp(self, text):
+    @staticmethod
+    @lru_cache(maxsize=1000)
+    def get_jsonp(text):
         try:
             jsonp_str = re.search(r"\((.*)\)", text, re.S)
             if jsonp_str:
@@ -905,7 +917,8 @@ class Dun163:
         except:
             return {}
 
-    def random_jsonp_str(self):
+    @staticmethod
+    def random_jsonp_str():
         s = string.ascii_lowercase + string.digits
         text = ''.join(random.choices(s, k=7))
         return "__JSONP_" + text + '_'
@@ -1034,7 +1047,11 @@ class Dun163:
                 if len(click_points) >= 3:
                     self._current_click_points = click_points[:3]
                     return click_points[:3], img_time
-            return self.generate_emergency_clicks(), img_time
+            fallback_points = self.generate_emergency_clicks()
+            partial_rects = [rect for rect in [rect1, rect2, rect3] if rect is not None and len(rect) >= 4]
+            click_points = merge_detected_with_fallback(partial_rects, fallback_points) if partial_rects else fallback_points
+            self._current_click_points = click_points
+            return click_points, img_time
         except Exception as e:
             return self.generate_emergency_clicks(), 0.0
 
@@ -1060,7 +1077,7 @@ class Dun163:
             click_points = []
             for x, y in selected_pattern:
                 rx = cx + (x - cx) * math.cos(angle) - (y - cy) * math.sin(angle)
-                ry = cy + (x - cy) * math.sin(angle) + (y - cy) * math.cos(angle)
+                ry = cy + (x - cx) * math.sin(angle) + (y - cy) * math.cos(angle)
                 offset_x = int(random.gauss(0, 8))
                 offset_y = int(random.gauss(0, 8))
                 final_x = max(10, min(int(rx) + offset_x, 310))
@@ -1162,27 +1179,14 @@ class Dun163:
                 pass
             return False
 
-_global_cycle_count = 0
-_global_cycle_lock = threading.Lock()
-
-def periodic_cleanup():
-    global _global_cycle_count
-    with _global_cycle_lock:
-        _global_cycle_count += 1
-        if _global_cycle_count % 50 == 0:
-            gc.collect()
-            if USE_CUDA:
-                torch.cuda.empty_cache()
-            _global_cycle_count = 0
-
 def worker_thread(thread_id, config):
     d = None
     cycle = 0
     while True:
         try:
-            if d is None or cycle >= 5:
+            if d is None or cycle >= 3:
                 d = None
-                config['UA'] = get_random_ua()
+                config['UA'] = UserAgent().random
                 config['DOMAIN'] = random.choice(DUN163_DOMAINS)
                 d = Dun163(
                     id_=config['ID_'],
@@ -1195,15 +1199,16 @@ def worker_thread(thread_id, config):
                 cycle = 0
             success = d.run()
             cycle += 1
-            periodic_cleanup()
             if success:
-                cycle = 5
+                logger.success(f"T-{thread_id} | Success")
+                cycle = 3
         except Exception as e:
+            logger.error(f"T-{thread_id} | Worker crashed: {e}")
             d = None
             continue
 
 def main():
-    logger.info("Starting CN31 Solver (Optimized)...")
+    logger.info("Starting CN31 Solver...")
     model_state = initialize_global_model()
     if not model_state:
         logger.error("Model not available - cannot continue")
@@ -1217,6 +1222,8 @@ def main():
         'ID_': ID,
         'REFERER': REFERER,
         'FP_H': FP_H,
+        'UA': UserAgent().random,
+        'DOMAIN': DUN163_DOMAINS[0]
     }
     NUM_THREADS = int(input("Number of threads: ").strip())
     logger.info(f"Starting {NUM_THREADS} worker threads")
@@ -1224,19 +1231,25 @@ def main():
     logger.info(f"REFERER: {REFERER}")
     logger.info(f"Server URL: {TOKEN_SERVER_URL}")
     logger.info("-" * 50)
-    with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
-        futures = []
-        for i in range(NUM_THREADS):
-            thread_config = config.copy()
-            thread_config['UA'] = get_random_ua()
-            thread_config['DOMAIN'] = DUN163_DOMAINS[i % len(DUN163_DOMAINS)]
-            futures.append(executor.submit(worker_thread, i+1, thread_config))
+    while True:
         try:
-            for future in futures:
-                future.result()
+            with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
+                futures = []
+                for i in range(NUM_THREADS):
+                    thread_config = config.copy()
+                    thread_config['UA'] = UserAgent().random
+                    thread_config['DOMAIN'] = DUN163_DOMAINS[i % len(DUN163_DOMAINS)]
+                    future = executor.submit(worker_thread, i+1, thread_config)
+                    futures.append(future)
+                for future in futures:
+                    future.result()
         except KeyboardInterrupt:
             logger.warning("Stopping...")
             executor.shutdown(wait=False)
+            break
+        except Exception as e:
+            logger.error(f"Main loop crashed: {e}")
+            continue
 
 if __name__ == '__main__':
     main()
